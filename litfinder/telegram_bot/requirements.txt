@@ -1,0 +1,6 @@
+# LitFinder Telegram Bot Dependencies
+# Use pre-built wheels for Python 3.13 compatibility
+aiogram>=3.4.0
+httpx>=0.26.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
