@@ -812,14 +812,27 @@ Package Registry:   GitHub Container Registry (ghcr.io)
 ### 6.2. Надежность & Доступность
 
 ```
-SLA: 99.5% uptime (≤3.6 часа downtime/месяц)
-RTO (Recovery Time Objective): 15 минут
+SLA (поэтапно):
+  ┌──────────────────┬──────────┬────────────────────────────────┐
+  │  Фаза            │  SLA     │  Архитектура                   │
+  ├──────────────────┼──────────┼────────────────────────────────┤
+  │  MVP (месяц 1-3) │  95.0%   │  1 API инстанс (≤36ч down/мес) │
+  │  Scale (месяц 4-6)│ 99.0%   │  2 инстанса + LB              │
+  │  Prod (месяц 6+) │  99.5%   │  K8s + auto-scaling           │
+  └──────────────────┴──────────┴────────────────────────────────┘
+
+RTO (Recovery Time Objective): 30 минут (MVP) → 15 мин (Prod)
 RPO (Recovery Point Objective): 1 час
+
+Окна обслуживания (MVP):
+  - Плановое: вт/чт 03:00-04:00 UTC (уведомление за 24ч)
+  - Деплой: blue-green через PM2 reload (≤10 сек downtime)
+  - Плановый downtime НЕ считается в SLA
 
 Мониторинг:
   - Health checks каждые 30 сек
-  - Database replication (primary-replica)
-  - Автоматический failover
+  - Database replication (primary-replica) — с фазы Scale
+  - Автоматический failover — с фазы Scale
   - Резервные копии каждый час
 ```
 
@@ -1729,8 +1742,8 @@ Performance:
   - Database query time P95: целевая <200ms
 
 Reliability:
-  - Uptime: целевая 99.5%
-  - MTTR (Mean Time To Recover): целевая <15 мин
+  - Uptime: целевая 95% (MVP) → 99% (Scale) → 99.5% (Prod)
+  - MTTR (Mean Time To Recover): целевая <30 мин (MVP) → <15 мин (Prod)
   - Backup success rate: 100%
 
 Scalability:
