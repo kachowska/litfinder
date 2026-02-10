@@ -1220,27 +1220,54 @@ components:
 ### 8.2. Основные Endpoints
 
 ```
-GET  /health                    Статус сервиса
-POST /search                    Поиск статей
-POST /bibliography              Генерация списка литературы (лимит: 10/день Free, 100 Pro)
-POST /bibliography/validate     Валидация списка
-GET  /bibliography/{id}         Получить список литературы
-DELETE /bibliography/{id}       Удалить список
-GET  /user/usage                Статистика (вкл. остаток лимитов Claude)
+── System ──────────────────────────────────────────────────────
+GET  /health                           Статус сервиса
 
-POST /auth/register             Регистрация
-POST /auth/login                Вход
-POST /auth/logout               Выход
-POST /auth/refresh              Обновить токен
+── Search ──────────────────────────────────────────────────────
+POST /search                           Поиск статей
+GET  /search/suggestions               Автодополнение запросов
 
-GET  /user/profile              Профиль пользователя
-PUT  /user/profile              Обновить профиль
-GET  /user/searches             История поисков
-GET  /user/usage                Статистика использования
+── Articles ────────────────────────────────────────────────────
+GET  /articles/{id}                    Полная информация о статье
 
-POST /export/{format}           Экспорт в формат (docx, pdf, bibtex, ris)
+── Bibliography (ГОСТ генерация) ───────────────────────────────
+POST /bibliography                     Генерация ГОСТ (лимит: 10/день Free, 100 Pro)
+POST /bibliography/validate            Валидация списка
 
-GET  /tg/webhook                Telegram webhook endpoint
+── Bibliography Lists (CRUD) ───────────────────────────────────
+POST   /bibliography/lists             Создать новый список
+GET    /bibliography/lists             Все списки пользователя
+GET    /bibliography/lists/{id}        Получить список
+PUT    /bibliography/lists/{id}        Обновить (имя, стиль, сортировка)
+DELETE /bibliography/lists/{id}        Удалить список
+POST   /bibliography/lists/{id}/items  Добавить статью в список
+DELETE /bibliography/lists/{id}/items/{article_id}  Удалить статью из списка
+
+── Auth ────────────────────────────────────────────────────────
+POST /auth/register                    Регистрация
+POST /auth/login                       Вход
+POST /auth/logout                      Выход
+POST /auth/refresh                     Обновить токен
+
+── User ────────────────────────────────────────────────────────
+GET  /user/profile                     Профиль пользователя
+PUT  /user/profile                     Обновить профиль
+GET  /user/searches                    История поисков
+GET  /user/usage                       Статистика (вкл. остаток лимитов Claude)
+GET  /user/export                      Экспорт данных (GDPR)
+DELETE /user                           Удалить аккаунт (soft delete → 30д)
+
+── Subscriptions ───────────────────────────────────────────────
+GET  /subscriptions/plans              Доступные тарифы (Free/Pro/Enterprise)
+POST /subscriptions/subscribe          Оформить подписку
+POST /subscriptions/cancel             Отменить подписку
+GET  /subscriptions/current            Текущая подписка пользователя
+
+── Export ──────────────────────────────────────────────────────
+POST /export/{format}                  Экспорт в формат (docx, pdf, bibtex, ris)
+
+── Telegram ────────────────────────────────────────────────────
+POST /tg/webhook                       Telegram webhook endpoint
 ```
 
 ### 8.3. Стандартный формат ошибок
