@@ -601,6 +601,66 @@ Cache:
   - Сокращение стоимости ~90%
 ```
 
+### 4.4. Embedding Service (OpenAI)
+
+**Модель:** `text-embedding-3-small` (OpenAI)  
+**Размерность:** 1536 (соответствует `VECTOR(1536)` в таблице `articles`)  
+**Endpoint:** `https://api.openai.com/v1/embeddings`  
+**Auth:** Bearer token (`OPENAI_API_KEY`)  
+
+#### 4.4.1. Решение по таймингу
+
+```
+Стратегия: Гибридная (precompute + on-query)
+
+1. PRECOMPUTE на ingestion (основной путь):
+   → При harvesting из OpenAlex/CyberLeninka:
+     title + abstract → embedding → сохранение в articles.embedding
+   → Batch API: до 2048 текстов за один вызов
+   → Celery worker обрабатывает очередь в фоне
+
+2. ON-QUERY для поискового запроса:
+   → Пользовательский запрос → embedding → pgvector cosine similarity
+   → Один вызов API на каждый поисковый запрос
+   → Кэш в Redis (TTL 24ч) для повторных запросов
+```
+
+#### 4.4.2. API интеграция
+
+```python
+# Пример вызова
+import openai
+
+response = openai.embeddings.create(
+    model="text-embedding-3-small",
+    input=["текст статьи для векторизации"],
+    dimensions=1536  # явное указание размерности
+)
+vector = response.data[0].embedding  # list[float] длиной 1536
+```
+
+#### 4.4.3. Лимиты, стоимость и обработка ошибок
+
+| Параметр | Значение |
+|----------|----------|
+| Rate limit | 3,000 RPM / 1,000,000 TPM |
+| Max input | 8,191 токенов на текст |
+| Стоимость | $0.020 / 1M токенов |
+| Latency | ~50-100ms на запрос |
+| **Оценка MVP** | **~100k статей × ~200 токенов = 20M токенов = $0.40** |
+
+```
+Обработка ошибок:
+  - HTTP 429 (Rate limit) → exponential backoff (1s, 2s, 4s, max 60s)
+  - HTTP 500/503 → retry 3 раза, затем fallback на детерминистический embedding
+  - Timeout (>5s) → cancel + retry
+  - Невалидный input (>8191 tokens) → truncate до 8000 токенов
+
+Fallback (без API):
+  - Детерминистический embedding на основе TF-IDF + хеширования
+  - Качество ниже, но система остаётся работоспособной
+```
+
 ---
 
 ## 5. ТЕХНИЧЕСКИЙ СТЕК
@@ -616,6 +676,7 @@ Async:          asyncio + aiohttp
 Caching:        Redis 7.0+
 Task Queue:     Celery + RabbitMQ (для harvesting)
 LLM Client:     anthropic-sdk (Python)
+Embeddings:     openai (Python SDK) → text-embedding-3-small
 ```
 
 ### 5.2. Frontend
@@ -687,17 +748,25 @@ Package Registry:   GitHub Container Registry (ghcr.io)
 │  └─ bibliography_lists                             │
 └──────────────────────┬────────────────────────────┘
                        │
-    ┌──────────────────┼──────────────────┐
-    ▼                  ▼                  ▼
-┌────────┐    ┌──────────────┐    ┌────────────┐
-│ Redis  │    │ OpenAlex API │    │CyberLeninka│
-│(Cache) │    │              │    │ OAI-PMH    │
-└────────┘    └──────────────┘    └────────────┘
-                                        │
-                                   ┌────▼────┐
-                                   │Claude   │
-                                   │API      │
-                                   └─────────┘
+     ┌──────────────────┼──────────────────┐
+     ▼                  ▼                  ▼
+ ┌────────┐    ┌──────────────┐    ┌────────────┐
+ │ Redis  │    │ OpenAlex API │    │CyberLeninka│
+ │(Cache) │    │              │    │ OAI-PMH    │
+ └────────┘    └──────────────┘    └────────────┘
+                    │                     │
+          ┌─────────┼─────────────────────┘
+          ▼         ▼
+     ┌──────────────────────┐
+     │  Embedding Service   │ ← text-embedding-3-small (1536-d)
+     │  (OpenAI API)        │   Precompute on ingestion +
+     │  └→ pgvector cosine  │   On-demand for queries
+     └──────────────────────┘
+                    │
+               ┌────▼────┐
+               │Claude   │ ← ГОСТ formatting,
+               │API      │   query expansion
+               └─────────┘
 ```
 
 ---
@@ -854,7 +923,7 @@ users                           articles
 searches (history)             ├─ concepts (JSONB)
 ├─ id (UUID, PK)               ├─ cited_by_count (INT)
 ├─ user_id (FK → users)        ├─ open_access (BOOL)
-├─ query (TEXT)                ├─ embedding (VECTOR(1536))
+├─ query (TEXT)                ├─ embedding (VECTOR(1536))    ← OpenAI text-embedding-3-small
 ├─ results_count (INT)         ├─ created_at (TS)
 ├─ execution_ms (INT)          └─ harvested_from (VARCHAR)
 ├─ created_at (TS)
@@ -1707,5 +1776,5 @@ Scalability:
 ---
 
 **Версия:** 1.0  
-**Дата последнего обновления:** 22 января 2026  
+**Дата последнего обновления:** 10 февраля 2026  
 **Статус:** Утвержден для разработки MVP
