@@ -1282,6 +1282,71 @@ POST /export/{format}                  Экспорт в формат (docx, pdf
 ── Telegram ────────────────────────────────────────────────────
 POST /tg/webhook                       Telegram webhook endpoint
 ```
+```
+
+### 8.2.1. Детальная спецификация: GET /articles/{id}
+
+**Описание:** Получение полных данных о статье по её ID.
+**Auth:** Не требуется (public), но желателен для персонализации (history).
+**Rate Limit:** 60 req/min (IP), 1000 req/min (Auth).
+
+**Request:**
+- **Path:** `id` (UUID или external_id, например `openalex_W123`)
+- **Headers:** `Authorization: Bearer <token>` (опционально)
+
+**Response (200 OK):**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "external_id": "openalex_W213567890",
+  "source": "openalex",
+  "title": "Deep Learning in Education",
+  "authors": [
+    {
+      "name": "John Smith",
+      "affiliations": ["MIT"]
+    }
+  ],
+  "publication_year": 2024,
+  "journal": {
+    "name": "Journal of AI",
+    "volume": "12",
+    "issue": "3",
+    "issn": "1234-5678"
+  },
+  "abstract": "Full abstract text...",
+  "doi": "10.1234/ai.2024.001",
+  "url": "https://doi.org/10.1234/ai.2024.001",
+  "pdf_url": "https://openaccess.org/article.pdf",
+  "open_access": true,
+  "cited_by_count": 42,
+  "keywords": ["AI", "Education"],
+  "metadata": {
+    "harvested_at": "2026-01-20T10:00:00Z",
+    "concepts": ["Computer Science"]
+  }
+}
+```
+
+**Ошибки:**
+
+| HTTP Code | Error Code | Описание |
+|-----------|------------|----------|
+| 400 | `INVALID_ID` | Некорректный формат ID |
+| 404 | `ARTICLE_NOT_FOUND` | Статья не найдена |
+| 429 | `RATE_LIMITED` | Превышен лимит (см. Header `Retry-After`) |
+| 500 | `INTERNAL_ERROR` | Ошибка сервера |
+
+**Пример ошибки (404):**
+```json
+{
+  "error": {
+    "code": "ARTICLE_NOT_FOUND",
+    "message": "Article with id 'openalex_W000' not found",
+    "status": 404
+  }
+}
+```
 
 ### 8.3. Стандартный формат ошибок
 
