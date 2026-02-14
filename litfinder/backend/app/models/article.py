@@ -53,10 +53,10 @@ class Article(Base):
     # Metrics
     cited_by_count: Mapped[int] = mapped_column(Integer, default=0)
     open_access: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    # Vector embedding for semantic search
-    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536))
-    
+
+    # Vector embedding for semantic search (Gemini text-embedding-004 = 768 dims)
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(768))
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.api import search, bibliography, auth, user
+from app.api import search, bibliography, auth, user, collections, research
 from app.database import init_db
 
 
@@ -44,6 +44,8 @@ app.include_router(search.router, prefix="/api/v1", tags=["Search"])
 app.include_router(bibliography.router, prefix="/api/v1", tags=["Bibliography"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(user.router, prefix="/api/v1/user", tags=["User"])
+app.include_router(collections.router, prefix="/api/v1/collections", tags=["Collections"])
+app.include_router(research.router, prefix="/api/v1/research", tags=["Research Assistant"])
 
 
 @app.get("/health")

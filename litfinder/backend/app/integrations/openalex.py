@@ -5,6 +5,7 @@ https://docs.openalex.org
 OpenAlex is a free and open catalog of scientific papers, authors, and institutions.
 """
 import asyncio
+import logging
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import httpx
@@ -12,16 +13,20 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 # --- Configuration ---
 
 OPENALEX_BASE_URL = "https://api.openalex.org"
-OPENALEX_API_KEY = "AjuwfQEpWFSV0JcNLrTlYr"
+OPENALEX_API_KEY = settings.openalex_api_key or None
 OPENALEX_EMAIL = settings.openalex_email or "litfinder.ai@gmail.com"
 
 # Rate limit: 100 requests/minute for polite pool (with email)
 REQUEST_TIMEOUT = 30.0
 MAX_RETRIES = 3
+MAX_RETRY_AFTER = 300  # Cap retry delay at 5 minutes
+DEFAULT_RETRY_AFTER = 60  # Default retry delay if header is missing/invalid
 
 
 # --- Response Models ---
@@ -135,44 +140,104 @@ class OpenAlexClient:
             self.headers["api_key"] = OPENALEX_API_KEY
     
     async def _request(
-        self, 
-        endpoint: str, 
+        self,
+        endpoint: str,
         params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Make async request to OpenAlex API."""
+        """
+        Make async request to OpenAlex API with robust retry logic.
+
+        Handles:
+        - Rate limiting (429) with Retry-After header
+        - Timeouts with exponential backoff
+        - Server errors (500+) with exponential backoff
+        - Client errors (400-499) fail immediately
+        """
         url = f"{self.base_url}{endpoint}"
-        
+
         # Add email for polite pool
         if params is None:
             params = {}
         params["mailto"] = OPENALEX_EMAIL
-        
+
+        last_exception = None
+
         for attempt in range(MAX_RETRIES):
             try:
                 async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                     response = await client.get(url, params=params, headers=self.headers)
-                    
+
+                    # Handle rate limiting
                     if response.status_code == 429:
-                        # Rate limited - wait and retry
-                        retry_after = int(response.headers.get("Retry-After", 60))
+                        # Safely parse Retry-After header with fallback and capping
+                        hdr = response.headers.get("Retry-After")
+                        try:
+                            retry_after = int(hdr) if hdr else DEFAULT_RETRY_AFTER
+                            # Validate positive value
+                            if retry_after <= 0:
+                                logger.warning(f"Invalid Retry-After value {retry_after}, using default {DEFAULT_RETRY_AFTER}s")
+                                retry_after = DEFAULT_RETRY_AFTER
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Failed to parse Retry-After header '{hdr}': {e}. Using default {DEFAULT_RETRY_AFTER}s")
+                            retry_after = DEFAULT_RETRY_AFTER
+
+                        # Cap retry delay to prevent unbounded sleep
+                        if retry_after > MAX_RETRY_AFTER:
+                            logger.warning(f"Retry-After {retry_after}s exceeds maximum, capping to {MAX_RETRY_AFTER}s")
+                            retry_after = MAX_RETRY_AFTER
+
+                        logger.warning(f"Rate limited by OpenAlex. Retrying after {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
                         await asyncio.sleep(retry_after)
                         continue
-                    
+
                     response.raise_for_status()
+
+                    # Success
+                    if attempt > 0:
+                        logger.info(f"Request succeeded after {attempt + 1} attempts: {endpoint}")
+
                     return response.json()
-                    
-            except httpx.TimeoutException:
+
+            except httpx.TimeoutException as e:
+                last_exception = e
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    backoff = 2 ** attempt
+                    logger.warning(f"Request timeout to {endpoint}. Retrying in {backoff}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    await asyncio.sleep(backoff)
                     continue
+                logger.error(f"Request timeout after {MAX_RETRIES} attempts: {endpoint}")
                 raise
+
             except httpx.HTTPStatusError as e:
-                if e.response.status_code >= 500 and attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
+                last_exception = e
+                status_code = e.response.status_code
+
+                # Client errors (400-499) - don't retry (except 429 which is handled above)
+                if 400 <= status_code < 500:
+                    logger.error(f"Client error {status_code} from OpenAlex: {endpoint}")
+                    raise
+
+                # Server errors (500+) - retry with backoff
+                if status_code >= 500 and attempt < MAX_RETRIES - 1:
+                    backoff = 2 ** attempt
+                    logger.warning(f"Server error {status_code} from OpenAlex. Retrying in {backoff}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    await asyncio.sleep(backoff)
                     continue
+
+                logger.error(f"Server error {status_code} after {MAX_RETRIES} attempts: {endpoint}")
                 raise
-        
-        raise Exception(f"Failed to fetch from OpenAlex after {MAX_RETRIES} attempts")
+
+            except Exception as e:
+                last_exception = e
+                logger.error(f"Unexpected error requesting {endpoint}: {type(e).__name__}: {e}")
+                raise
+
+        # Should never reach here, but just in case
+        error_msg = f"Failed to fetch from OpenAlex after {MAX_RETRIES} attempts: {endpoint}"
+        logger.error(error_msg)
+        if last_exception:
+            raise last_exception
+        raise Exception(error_msg)
     
     async def search_works(
         self,
@@ -181,51 +246,93 @@ class OpenAlexClient:
         year_to: Optional[int] = None,
         language: Optional[List[str]] = None,
         concepts: Optional[List[str]] = None,
+        cited_by_count_min: Optional[int] = None,
+        cited_by_count_max: Optional[int] = None,
+        is_oa: Optional[bool] = None,
+        publication_type: Optional[str] = None,
         per_page: int = 20,
-        page: int = 1
+        page: Optional[int] = None,
+        cursor: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Search for academic works.
-        
+        Search for academic works with advanced filtering.
+
         Args:
             query: Search query (title, abstract)
             year_from: Filter by publication year (from)
             year_to: Filter by publication year (to)
             language: Filter by language codes (e.g., ["ru", "en"])
             concepts: Filter by concept IDs
+            cited_by_count_min: Minimum citation count
+            cited_by_count_max: Maximum citation count
+            is_oa: Filter for open access only
+            publication_type: Filter by type (article, review, etc.)
             per_page: Results per page (max 200)
-            page: Page number
-            
+            page: Page number (for page-based pagination, max 10,000 results)
+            cursor: Cursor for cursor-based pagination (unlimited results)
+
         Returns:
-            Dict with 'meta' and 'results' keys
+            Dict with 'meta', 'results', and optionally 'next_cursor' keys
+
+        Note:
+            - Use page for simple pagination (limited to 10,000 results / 50 pages)
+            - Use cursor for deep pagination (unlimited results)
+            - Cursor pagination is recommended for >10,000 results
         """
         params = {
             "search": query,
             "per_page": min(per_page, 200),
-            "page": page,
             "sort": "relevance_score:desc"
         }
-        
+
+        # Choose pagination method
+        if cursor:
+            # Cursor-based pagination (unlimited results)
+            params["cursor"] = cursor
+            logger.debug(f"Using cursor pagination: {cursor[:20]}...")
+        elif page:
+            # Page-based pagination (max 10,000 results)
+            params["page"] = page
+            if page > 50:
+                logger.warning(f"Page {page} exceeds OpenAlex limit (max 50 pages / 10,000 results). Consider using cursor pagination.")
+        else:
+            # Default to page 1
+            params["page"] = 1
+
         # Build filters
         filters = []
-        
+
         if year_from:
             filters.append(f"publication_year:>{year_from - 1}")
         if year_to:
             filters.append(f"publication_year:<{year_to + 1}")
+
         # Note: OpenAlex language filter requires specific format, skip for now
         # if language:
         #     lang_filter = "|".join(language)
         #     filters.append(f"language:{lang_filter}")
+
         if concepts:
             concept_filter = "|".join(concepts)
             filters.append(f"concepts.id:{concept_filter}")
-        
-        # Note: is_oa filter limits results too much for MVP
-        # filters.append("is_oa:true")
-        
+
+        # Citation count filters
+        if cited_by_count_min is not None:
+            filters.append(f"cited_by_count:>{cited_by_count_min - 1}")
+        if cited_by_count_max is not None:
+            filters.append(f"cited_by_count:<{cited_by_count_max + 1}")
+
+        # Open access filter
+        if is_oa is not None:
+            filters.append(f"is_oa:{str(is_oa).lower()}")
+
+        # Publication type filter (article, review, book-chapter, etc.)
+        if publication_type:
+            filters.append(f"type:{publication_type}")
+
         if filters:
             params["filter"] = ",".join(filters)
+            logger.debug(f"Applied filters: {params['filter']}")
         
         # Select specific fields to reduce response size
         params["select"] = ",".join([
@@ -236,7 +343,7 @@ class OpenAlexClient:
         ])
         
         result = await self._request("/works", params)
-        
+
         # Parse works
         works = []
         for item in result.get("results", []):
@@ -244,13 +351,21 @@ class OpenAlexClient:
                 work = OpenAlexWork(**item)
                 works.append(work)
             except Exception as e:
-                print(f"Error parsing work: {e}")
+                logger.warning(f"Failed to parse OpenAlex work: {e}", exc_info=True)
                 continue
-        
-        return {
+
+        # Build response
+        response = {
             "meta": result.get("meta", {}),
             "results": works
         }
+
+        # Include next_cursor if present (for cursor pagination)
+        if "next_cursor" in result.get("meta", {}):
+            response["next_cursor"] = result["meta"]["next_cursor"]
+            logger.debug(f"Next cursor available: {response['next_cursor'][:20]}...")
+
+        return response
     
     async def get_work(self, work_id: str) -> Optional[OpenAlexWork]:
         """Get single work by ID (e.g., W123456789)."""
@@ -258,7 +373,7 @@ class OpenAlexClient:
             result = await self._request(f"/works/{work_id}")
             return OpenAlexWork(**result)
         except Exception as e:
-            print(f"Error fetching work {work_id}: {e}")
+            logger.error(f"Failed to fetch work {work_id}: {e}", exc_info=True)
             return None
     
     async def search_concepts(self, query: str, per_page: int = 10) -> List[OpenAlexConcept]:

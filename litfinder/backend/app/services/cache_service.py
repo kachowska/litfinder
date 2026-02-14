@@ -106,11 +106,46 @@ class CacheService:
         client = await self._get_client()
         if client is None:
             return False
-        
+
         try:
             full_key = f"{CACHE_PREFIX}{key}"
             return await client.exists(full_key) > 0
         except Exception:
+            return False
+
+    async def set_if_not_exists(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[timedelta] = None
+    ) -> bool:
+        """
+        Atomically set value only if key does not exist (SETNX).
+
+        Args:
+            key: Cache key
+            value: Value to set
+            ttl: Optional TTL for the key
+
+        Returns:
+            True if key was set (did not exist), False if key already exists
+        """
+        client = await self._get_client()
+        if client is None:
+            return False
+
+        try:
+            full_key = f"{CACHE_PREFIX}{key}"
+            serialized = json.dumps(value, ensure_ascii=False, default=str)
+
+            # Use SET with NX and EX options for atomic set-if-not-exists with TTL
+            ttl_seconds = int(ttl.total_seconds()) if ttl else int(DEFAULT_TTL.total_seconds())
+            result = await client.set(full_key, serialized, ex=ttl_seconds, nx=True)
+
+            # Redis SET with NX returns True if set, None if key already exists
+            return result is True
+        except Exception as e:
+            print(f"Cache set_if_not_exists error: {e}")
             return False
     
     async def clear_search_cache(self) -> int:

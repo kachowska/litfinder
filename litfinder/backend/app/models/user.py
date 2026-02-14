@@ -48,6 +48,7 @@ class User(Base):
     # Relationships
     bibliography_lists = relationship("BibliographyList", back_populates="user", cascade="all, delete-orphan")
     search_history = relationship("SearchHistory", back_populates="user", cascade="all, delete-orphan")
+    collections = relationship("Collection", back_populates="user", cascade="all, delete-orphan")
     
     @property
     def is_pro(self) -> bool:

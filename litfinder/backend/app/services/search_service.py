@@ -26,30 +26,39 @@ class SearchService:
         query: str,
         limit: int = 20,
         offset: int = 0,
+        cursor: Optional[str] = None,
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         language: Optional[List[str]] = None,
+        cited_by_count_min: Optional[int] = None,
+        cited_by_count_max: Optional[int] = None,
+        is_oa: Optional[bool] = None,
+        publication_type: Optional[str] = None,
         sources: Optional[List[str]] = None,
         use_cache: bool = True
     ) -> dict:
         """
         Search for articles across all sources.
-        
-        Returns dict with total, results, and execution_time_ms.
+
+        Returns dict with total, results, next_cursor, and execution_time_ms.
         """
         start_time = time.time()
         
-        # Check cache first
-        if use_cache:
+        # Check cache first (skip cache for cursor pagination)
+        if use_cache and not cursor:
             cache_key = hash_query(query, {
                 "limit": limit,
                 "offset": offset,
                 "year_from": year_from,
                 "year_to": year_to,
                 "language": language,
+                "cited_by_count_min": cited_by_count_min,
+                "cited_by_count_max": cited_by_count_max,
+                "is_oa": is_oa,
+                "publication_type": publication_type,
                 "sources": sources
             })
-            
+
             cached = await cache_service.get_search_results(cache_key)
             if cached:
                 cached["from_cache"] = True
@@ -58,22 +67,28 @@ class SearchService:
         
         results = []
         total = 0
-        
+        next_cursor = None
+
         # Determine which sources to search
         search_sources = sources or ["openalex", "cyberleninka"]
-        
+
         # Search sources in parallel
         tasks = []
-        
+
         if "openalex" in search_sources:
-            tasks.append(self._search_openalex(query, limit, offset, year_from, year_to, language))
-        
+            tasks.append(self._search_openalex(
+                query, limit, offset, cursor,
+                year_from, year_to, language,
+                cited_by_count_min, cited_by_count_max,
+                is_oa, publication_type
+            ))
+
         if "cyberleninka" in search_sources:
             tasks.append(self._search_cyberleninka(query, limit, year_from, year_to))
-        
+
         if tasks:
             source_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             for res in source_results:
                 if isinstance(res, Exception):
                     print(f"Search source error: {res}")
@@ -81,6 +96,9 @@ class SearchService:
                 if res:
                     results.extend(res.get("results", []))
                     total += res.get("total", 0)
+                    # Capture next_cursor from OpenAlex (first source with cursor)
+                    if not next_cursor and res.get("next_cursor"):
+                        next_cursor = res["next_cursor"]
         
         # Rank results using multi-signal scoring
         if results:
@@ -91,18 +109,19 @@ class SearchService:
             )
         
         execution_ms = int((time.time() - start_time) * 1000)
-        
+
         response = {
             "total": total,
             "results": results[:limit],
+            "next_cursor": next_cursor,
             "execution_time_ms": execution_ms,
             "from_cache": False
         }
-        
-        # Cache results
-        if use_cache and results:
+
+        # Cache results (skip caching for cursor pagination)
+        if use_cache and results and not cursor:
             await cache_service.set_search_results(cache_key, response)
-        
+
         return response
     
     async def _search_openalex(
@@ -110,34 +129,57 @@ class SearchService:
         query: str,
         limit: int,
         offset: int,
+        cursor: Optional[str],
         year_from: Optional[int],
         year_to: Optional[int],
-        language: Optional[List[str]]
+        language: Optional[List[str]],
+        cited_by_count_min: Optional[int],
+        cited_by_count_max: Optional[int],
+        is_oa: Optional[bool],
+        publication_type: Optional[str]
     ) -> dict:
-        """Search OpenAlex source."""
+        """Search OpenAlex source with advanced filtering."""
         try:
-            page = (offset // limit) + 1
+            # Choose pagination method
+            if cursor:
+                # Use cursor-based pagination
+                page = None
+            else:
+                # Use page-based pagination
+                page = (offset // limit) + 1
+
             openalex_results = await openalex_client.search_works(
                 query=query,
                 year_from=year_from,
                 year_to=year_to,
                 language=language,
+                cited_by_count_min=cited_by_count_min,
+                cited_by_count_max=cited_by_count_max,
+                is_oa=is_oa,
+                publication_type=publication_type,
                 per_page=limit,
-                page=page
+                page=page,
+                cursor=cursor
             )
-            
+
             articles = []
             for work in openalex_results.get("results", []):
                 article_dict = work_to_article_dict(work)
                 article_dict["relevance_score"] = 0.9
                 articles.append(article_dict)
-            
+
             meta = openalex_results.get("meta", {})
-            return {
+            response = {
                 "total": meta.get("count", 0),
                 "results": articles
             }
-            
+
+            # Include next_cursor if available
+            if "next_cursor" in openalex_results:
+                response["next_cursor"] = openalex_results["next_cursor"]
+
+            return response
+
         except Exception as e:
             print(f"OpenAlex search error: {e}")
             return {"total": 0, "results": []}

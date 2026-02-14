@@ -1,164 +1,260 @@
 """
 Embedding Service
-Generate vector embeddings for semantic search using Claude or OpenAI.
+Generate vector embeddings for semantic search using Google Gemini.
 """
 import asyncio
 from typing import List, Optional
 import hashlib
-import httpx
-from anthropic import AsyncAnthropic
+import google.generativeai as genai
 
 from app.config import settings
 
 
 # --- Configuration ---
 
-EMBEDDING_MODEL = "voyage-large-2"  # or "text-embedding-3-small" for OpenAI
-EMBEDDING_DIMENSION = 1536  # Must match pgvector column in Article model
-MAX_BATCH_SIZE = 128
-CACHE_EMBEDDINGS = True
+EMBEDDING_MODEL = "models/text-embedding-004"  # Gemini embedding model
+EMBEDDING_DIMENSION = 768  # Gemini text-embedding-004 dimension
+MAX_BATCH_SIZE = 100  # Gemini batch limit
+MAX_TEXT_LENGTH = 8000  # ~8000 tokens max
 
 
 # --- Embedding Service ---
 
 class EmbeddingService:
-    """Generate text embeddings for semantic search."""
-    
+    """Generate text embeddings for semantic search using Google Gemini."""
+
     def __init__(self):
-        self._anthropic = None
         self._initialized = False
         self._use_mock = False
-    
+
     def _ensure_client(self):
-        """Initialize Anthropic client lazily."""
+        """Initialize Gemini client lazily."""
         if not self._initialized:
-            api_key = settings.anthropic_api_key
+            api_key = settings.gemini_api_key
             if api_key:
-                self._anthropic = AsyncAnthropic(api_key=api_key)
+                genai.configure(api_key=api_key)
             else:
                 self._use_mock = True
-                print("⚠️ No Anthropic API key - using mock embeddings")
+                print("⚠️  No Gemini API key - using mock embeddings")
             self._initialized = True
-    
+
     async def get_embedding(self, text: str) -> List[float]:
         """
         Get embedding vector for a single text.
-        
+
         Args:
             text: Text to embed (will be truncated if too long)
-            
+
         Returns:
             List of float values (dimension = EMBEDDING_DIMENSION)
         """
         self._ensure_client()
-        
-        # Truncate text if too long (max ~8000 tokens)
-        text = text[:30000] if text else ""
-        
+
+        # Truncate text if too long
+        text = text[:MAX_TEXT_LENGTH] if text else ""
+
+        if not text.strip():
+            # Return zero vector for empty text
+            return [0.0] * EMBEDDING_DIMENSION
+
         if self._use_mock:
             return self._mock_embedding(text)
-        
+
         try:
-            # Use Anthropic's message API to generate pseudo-embedding
-            # Note: Claude doesn't have native embedding API, so we use a workaround
-            # In production, consider using OpenAI or Voyage AI for true embeddings
-            return await self._generate_embedding_via_api(text)
-            
+            # Use Gemini embeddings API
+            # Note: genai is sync, so we run it in executor
+            import asyncio
+            loop = asyncio.get_event_loop()
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: genai.embed_content(
+                    model=EMBEDDING_MODEL,
+                    content=text,
+                    task_type="retrieval_document"
+                )
+            )
+
+            embedding = result['embedding']
+
+            # Verify dimension
+            if len(embedding) != EMBEDDING_DIMENSION:
+                raise ValueError(
+                    f"Expected embedding dimension {EMBEDDING_DIMENSION}, "
+                    f"got {len(embedding)}"
+                )
+
+            return embedding
+
         except Exception as e:
-            print(f"Embedding error: {e}")
+            print(f"❌ Embedding error: {e}")
             return self._mock_embedding(text)
-    
+
     async def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """
         Get embeddings for multiple texts in batch.
-        
+
         Args:
             texts: List of texts to embed
-            
+
         Returns:
             List of embedding vectors
         """
-        # Process in parallel with rate limiting
-        semaphore = asyncio.Semaphore(10)
-        
-        async def get_with_semaphore(text: str) -> List[float]:
-            async with semaphore:
-                return await self.get_embedding(text)
-        
-        tasks = [get_with_semaphore(t) for t in texts]
-        return await asyncio.gather(*tasks)
-    
-    async def _generate_embedding_via_api(self, text: str) -> List[float]:
+        self._ensure_client()
+
+        if not texts:
+            return []
+
+        # Truncate texts
+        texts = [t[:MAX_TEXT_LENGTH] if t else "" for t in texts]
+
+        # Replace empty texts with placeholder
+        processed_texts = [t if t.strip() else "empty" for t in texts]
+
+        if self._use_mock:
+            return [self._mock_embedding(t) for t in processed_texts]
+
+        try:
+            # Process in batches
+            all_embeddings = []
+            import asyncio
+            loop = asyncio.get_event_loop()
+
+            for i in range(0, len(processed_texts), MAX_BATCH_SIZE):
+                batch = processed_texts[i:i + MAX_BATCH_SIZE]
+
+                # Gemini batch embedding
+                result = await loop.run_in_executor(
+                    None,
+                    lambda b=batch: genai.embed_content(
+                        model=EMBEDDING_MODEL,
+                        content=b,
+                        task_type="retrieval_document"
+                    ),
+                    batch
+                )
+
+                # Extract embeddings
+                if isinstance(result['embedding'][0], list):
+                    # Batch returned multiple embeddings
+                    batch_embeddings = result['embedding']
+                else:
+                    # Single embedding returned as flat list
+                    batch_embeddings = [result['embedding']]
+
+                all_embeddings.extend(batch_embeddings)
+
+            # Replace embeddings for empty texts with zero vectors
+            for i, text in enumerate(texts):
+                if not text.strip():
+                    all_embeddings[i] = [0.0] * EMBEDDING_DIMENSION
+
+            return all_embeddings
+
+        except Exception as e:
+            print(f"❌ Batch embedding error: {e}")
+            return [self._mock_embedding(t) for t in processed_texts]
+
+    def _mock_embedding(self, text: str) -> List[float]:
         """
-        Generate embedding using external API.
-        
-        For production, use OpenAI text-embedding-3-small or Voyage AI.
-        This implementation uses a deterministic hash-based approach
-        as a placeholder until proper embedding API is configured.
-        """
-        # For MVP: use deterministic pseudo-embedding based on text hash
-        # This allows semantic search to work with consistent results
-        # Replace with real embedding API for production
-        return self._deterministic_embedding(text)
-    
-    def _deterministic_embedding(self, text: str) -> List[float]:
-        """
-        Generate deterministic pseudo-embedding from text.
-        
-        Uses a hash-based approach that produces consistent vectors
-        for the same input text. Not as good as real embeddings,
-        but allows testing the vector search pipeline.
+        Generate deterministic mock embedding from text.
+
+        Uses hash-based approach for consistent results.
+        Not as good as real embeddings, but allows testing.
         """
         import struct
-        
-        # Create multiple hashes for different "dimensions"
+
         embedding = []
-        
-        # Normalize text
         text_lower = text.lower().strip()
-        
+
         for i in range(EMBEDDING_DIMENSION):
             # Hash text with index to get unique value per dimension
             h = hashlib.sha256(f"{text_lower}:{i}".encode()).digest()
-            # Convert first 8 bytes to float in range [-1, 1]
+            # Convert first 8 bytes to float
             value = struct.unpack('d', h[:8])[0]
             # Normalize to [-1, 1]
             normalized = (value % 2) - 1
             embedding.append(normalized)
-        
-        # Normalize vector length
+
+        # Normalize vector length to unit sphere
         norm = sum(x*x for x in embedding) ** 0.5
         if norm > 0:
             embedding = [x / norm for x in embedding]
-        
+
         return embedding
-    
-    def _mock_embedding(self, text: str) -> List[float]:
-        """Generate mock embedding for testing."""
-        return self._deterministic_embedding(text)
-    
+
     async def compute_similarity(
-        self, 
-        embedding1: List[float], 
+        self,
+        embedding1: List[float],
         embedding2: List[float]
     ) -> float:
         """
         Compute cosine similarity between two embeddings.
-        
+
         Returns:
             Similarity score between -1 and 1
         """
         if len(embedding1) != len(embedding2):
             return 0.0
-        
+
         dot_product = sum(a * b for a, b in zip(embedding1, embedding2))
         norm1 = sum(a * a for a in embedding1) ** 0.5
         norm2 = sum(b * b for b in embedding2) ** 0.5
-        
+
         if norm1 == 0 or norm2 == 0:
             return 0.0
-        
+
         return dot_product / (norm1 * norm2)
+
+
+# --- Text Preparation ---
+
+def prepare_article_text(article: dict) -> str:
+    """
+    Prepare article text for embedding.
+    Combines title, abstract, and concepts for richer embedding.
+    """
+    parts = []
+
+    # Title (most important)
+    if article.get("title"):
+        parts.append(article["title"])
+
+    # Abstract
+    if article.get("abstract"):
+        parts.append(article["abstract"][:2000])  # Limit abstract length
+
+    # Concepts/keywords
+    concepts = article.get("concepts", [])
+    if concepts:
+        concept_names = [c.get("name", "") for c in concepts[:10]]
+        parts.append("Keywords: " + ", ".join(concept_names))
+
+    # Authors (less weight but useful for author search)
+    authors = article.get("authors", [])
+    if authors:
+        author_names = [a.get("name", "") for a in authors[:5] if a.get("name")]
+        if author_names:
+            parts.append("Authors: " + ", ".join(author_names))
+
+    return " ".join(parts)
+
+
+def prepare_query_text(query: str, enhanced_keywords: List[str] = None) -> str:
+    """
+    Prepare search query text for embedding.
+    Optionally include enhanced keywords from Claude.
+    """
+    parts = [query]
+
+    if enhanced_keywords:
+        parts.append("Keywords: " + ", ".join(enhanced_keywords))
+
+    return " ".join(parts)
+
+
+# --- Singleton instance ---
+embedding_service = EmbeddingService()
 
 
 # --- Text Preparation ---
