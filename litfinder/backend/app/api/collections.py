@@ -18,12 +18,13 @@ from app.database import get_db
 from app.models.user import User
 from app.models.collection import Collection, CollectionItem
 from app.utils.security import get_current_user
+from app.utils import sanitize_filename
 
 # Import schemas from the new schemas/collection.py file
 # For now, define them inline since we just created that file
 from pydantic import BaseModel, Field
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -561,3 +562,271 @@ async def remove_item_from_collection(
     logger.info(f"Removed work {work_id} from collection {collection_id}")
 
     return None
+
+
+# --- Collection Export Operations ---
+
+@router.get("/{collection_id}/bibliography")
+async def preview_collection_bibliography(
+    collection_id: UUID,
+    sort_by: str = Query("author", description="Sort order: author, year, title"),
+    style: str = Query("GOST_R_7_0_100_2018", description="Bibliography style (GOST_R_7_0_100_2018 or VAK_RB)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Preview collection bibliography in GOST format.
+
+    Returns formatted bibliography list for preview before export.
+    Useful for checking formatting before downloading.
+
+    Supported styles:
+    - GOST_R_7_0_100_2018 (default): Russian GOST standard
+    - VAK_RB: Belarus VAK requirements for dissertations
+    """
+    from app.services.gost_formatter import get_formatter, article_to_bibliography_entry
+    from app.services.search_service import SearchService
+
+    # Verify collection exists and belongs to user
+    collection_query = select(Collection).where(
+        and_(
+            Collection.id == collection_id,
+            Collection.user_id == current_user.id
+        )
+    ).options(selectinload(Collection.items))
+
+    collection_result = await db.execute(collection_query)
+    collection = collection_result.scalar_one_or_none()
+
+    if not collection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found"
+        )
+
+    if not collection.items:
+        return {
+            "collection_id": str(collection_id),
+            "title": collection.title,
+            "formatted_list": [],
+            "total": 0,
+            "style": style,
+            "sort_by": sort_by
+        }
+
+    # Fetch article data for all items (batch to avoid N+1 queries)
+    search_service = SearchService(db)
+    work_ids = [item.work_id for item in collection.items]
+    articles_dict = await search_service.get_articles_by_ids(work_ids)
+
+    # Preserve original order and filter out missing articles
+    articles = []
+    for item in collection.items:
+        article = articles_dict.get(item.work_id)
+        if article:
+            articles.append(article)
+
+    # Convert to bibliography entries
+    entries = [article_to_bibliography_entry(a) for a in articles]
+
+    # Get formatter for selected style
+    formatter = get_formatter(style)
+
+    # Format according to style
+    formatted = formatter.format_list(entries, sort_by)
+
+    return {
+        "collection_id": str(collection_id),
+        "title": collection.title,
+        "formatted_list": formatted,
+        "total": len(formatted),
+        "style": style,
+        "sort_by": sort_by,
+        "preview": True
+    }
+
+
+@router.get("/{collection_id}/export/{format}")
+async def export_collection(
+    collection_id: UUID,
+    format: str,
+    sort_by: str = Query("author", description="Sort order: author, year, title"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Export collection in specified format.
+
+    Supported formats:
+    - **gost** / **text**: GOST R 7.0.100-2018 formatted text
+    - **bibtex**: BibTeX format
+    - **ris**: RIS format (EndNote, Zotero, Mendeley)
+    - **docx** / **word**: Microsoft Word document
+    - **json**: Full metadata JSON
+    - **csv**: Simple CSV export
+
+    Returns file download with appropriate Content-Type.
+    """
+    from app.services.export_service import export_articles
+    from app.services.search_service import SearchService
+    from fastapi.responses import Response
+    import base64
+    import json
+    import csv
+    from io import StringIO
+
+    # Verify collection exists and belongs to user
+    collection_query = select(Collection).where(
+        and_(
+            Collection.id == collection_id,
+            Collection.user_id == current_user.id
+        )
+    ).options(selectinload(Collection.items))
+
+    collection_result = await db.execute(collection_query)
+    collection = collection_result.scalar_one_or_none()
+
+    if not collection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found"
+        )
+
+    if not collection.items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Collection is empty"
+        )
+
+    # Fetch article data for all items (batch to avoid N+1 queries)
+    search_service = SearchService(db)
+    work_ids = [item.work_id for item in collection.items]
+    articles_dict = await search_service.get_articles_by_ids(work_ids)
+
+    # Preserve original order, add notes, and filter out missing articles
+    articles = []
+    for item in collection.items:
+        article = articles_dict.get(item.work_id)
+        if article:
+            # Create a copy to avoid mutating cached SearchService objects
+            article_copy = article.copy()
+            article_copy["collection_notes"] = item.notes
+            articles.append(article_copy)
+        else:
+            logger.warning(f"Article {item.work_id} not found for export")
+
+    if not articles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No articles found in collection"
+        )
+
+    # Handle different export formats
+    if format in ["gost", "text", "bibtex", "ris", "docx", "word"]:
+        # Use export service for bibliography formats
+        result = export_articles(
+            articles=articles,
+            format=format,
+            sort_by=sort_by
+        )
+
+        # Return binary formats (Word)
+        if result.get("is_binary"):
+            content = base64.b64decode(result["content"])
+            safe_title = sanitize_filename(collection.title)
+            filename = f"{safe_title}_{format}.{result['format']}"
+            return Response(
+                content=content,
+                media_type=result["mime_type"],
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"'
+                }
+            )
+
+        # Return text formats
+        safe_title = sanitize_filename(collection.title)
+        filename = f"{safe_title}_{format}.{result['format']}"
+        return Response(
+            content=result["content"],
+            media_type=result["mime_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+
+    elif format == "json":
+        # Full metadata JSON export
+        export_data = {
+            "collection": {
+                "id": str(collection.id),
+                "title": collection.title,
+                "description": collection.description,
+                "tags": collection.tags,
+                "created_at": collection.created_at.isoformat(),
+                "updated_at": collection.updated_at.isoformat()
+            },
+            "articles": articles,
+            "total": len(articles),
+            "exported_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        content = json.dumps(export_data, ensure_ascii=False, indent=2)
+        safe_title = sanitize_filename(collection.title)
+        filename = f"{safe_title}_export.json"
+
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+        
+
+    elif format == "csv":
+        # Simple CSV export
+        output = StringIO()
+        writer = csv.writer(output)
+
+        # CSV header
+        writer.writerow([
+            "Title", "Authors", "Year", "Journal", "Volume", "Issue",
+            "Pages", "DOI", "URL", "Notes"
+        ])
+
+        # CSV rows
+        for article in articles:
+            authors_str = "; ".join(
+                a.get("name", "") for a in article.get("authors", [])
+            )
+            writer.writerow([
+                article.get("title", ""),
+                authors_str,
+                article.get("year", ""),
+                article.get("journal_name", ""),
+                article.get("volume", ""),
+                article.get("issue", ""),
+                article.get("pages", ""),
+                article.get("doi", ""),
+                article.get("pdf_url", "") or article.get("url", ""),
+                article.get("collection_notes", "")
+            ])
+
+        content = output.getvalue()
+        safe_title = sanitize_filename(collection.title)
+        filename = f"{safe_title}_export.csv"
+
+        # Encode to UTF-8 bytes and declare charset in Content-Type
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported export format: {format}. Supported: gost, bibtex, ris, docx, json, csv"
+        )

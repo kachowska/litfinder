@@ -3,14 +3,15 @@ Bibliography API Endpoints
 GOST bibliography generation and export
 """
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 import base64
 
 from app.database import get_db
 from app.services.gost_formatter import (
-    gost_formatter, 
+    gost_formatter,
+    get_formatter,
     article_to_bibliography_entry,
     BibliographyEntry
 )
@@ -19,6 +20,11 @@ from app.services.search_service import SearchService
 
 
 router = APIRouter()
+
+
+# --- Constants ---
+VALID_BIBLIOGRAPHY_STYLES = ["GOST_R_7_0_100_2018", "VAK_RB"]
+VALID_EXPORT_FORMATS = ["gost", "text", "bibtex", "ris", "docx", "word"]
 
 
 # --- Schemas ---
@@ -36,7 +42,7 @@ class BibliographyRequest(BaseModel):
 class ExportRequest(BaseModel):
     """Export request."""
     articles: List[dict]
-    format: str = Field("gost")  # gost, bibtex, ris, docx
+    format: str = Field("gost")  # gost, text, bibtex, ris, docx, word
     sort_by: str = Field("author")
 
 
@@ -106,9 +112,19 @@ async def generate_bibliography(
                 warnings.append(f"Missing year: {entry.title[:50]}")
         except Exception as e:
             errors.append(f"Failed to parse: {str(e)}")
-    
+
+    # Validate bibliography style
+    if request.style not in VALID_BIBLIOGRAPHY_STYLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported bibliography style: {request.style}. Supported: {', '.join(VALID_BIBLIOGRAPHY_STYLES)}"
+        )
+
+    # Get formatter for selected style
+    formatter = get_formatter(request.style)
+
     # Format according to style
-    formatted = gost_formatter.format_list(entries, request.sort_by)
+    formatted = formatter.format_list(entries, request.sort_by)
     
     # Generate export formats
     bibtex = export_service.export_to_bibtex(entries)
@@ -140,11 +156,17 @@ async def export_bibliography(
 ):
     """
     Export bibliography to file format.
-    
-    Supported formats: gost, bibtex, ris, docx
+
+    Supported formats: gost, text, bibtex, ris, docx, word
+
+    Note: For JSON and CSV export of raw article data, use the
+    collections export endpoint instead.
     """
-    if format not in ["gost", "text", "bibtex", "ris", "docx", "word"]:
-        raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
+    if format not in VALID_EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported format: {format}. Supported: {', '.join(VALID_EXPORT_FORMATS)}"
+        )
     
     if not request.articles:
         raise HTTPException(status_code=400, detail="No articles provided")
@@ -176,13 +198,25 @@ async def preview_format(
 ):
     """
     Preview formatting for a single article.
-    
+
     Useful for testing without full bibliography generation.
+
+    Supported styles:
+    - GOST_R_7_0_100_2018 (default)
+    - VAK_RB (Belarus VAK requirements)
     """
+    # Validate bibliography style
+    if style not in VALID_BIBLIOGRAPHY_STYLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported bibliography style: {style}. Supported: {', '.join(VALID_BIBLIOGRAPHY_STYLES)}"
+        )
+
     try:
         entry = article_to_bibliography_entry(article)
-        formatted = gost_formatter.format(entry)
-        
+        formatter = get_formatter(style)
+        formatted = formatter.format(entry)
+
         return {
             "formatted": formatted,
             "style": style,
@@ -201,14 +235,21 @@ async def list_styles():
                 "id": "GOST_R_7_0_100_2018",
                 "name": "ГОСТ Р 7.0.100-2018",
                 "description": "Российский стандарт библиографического описания",
+                "country": "Россия",
                 "default": True
             },
             {
-                "id": "VAK",
-                "name": "ВАК",
-                "description": "Формат для диссертаций ВАК",
-                "default": False
+                "id": "VAK_RB",
+                "name": "ВАК РБ",
+                "description": "Требования ВАК Республики Беларусь для диссертаций",
+                "country": "Беларусь",
+                "default": False,
+                "features": [
+                    "Использует длинное тире (–)",
+                    "Максимум 1 автор + [и др.]",
+                    "Дата обращения для электронных ресурсов обязательна"
+                ]
             }
         ],
-        "export_formats": ["gost", "bibtex", "ris", "docx"]
+        "export_formats": VALID_EXPORT_FORMATS
     }

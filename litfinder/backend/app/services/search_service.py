@@ -245,5 +245,82 @@ class SearchService:
                 article_dict = work_to_article_dict(work)
                 await cache_service.set_article(article_id, article_dict)
                 return article_dict
-        
+
         return None
+
+    async def get_articles_by_ids(self, article_ids: List[str]) -> dict[str, dict]:
+        """
+        Batch fetch articles by IDs (from cache, DB, or external sources).
+
+        More efficient than calling get_article_by_id in a loop (avoids N+1 queries).
+
+        Args:
+            article_ids: List of article IDs to fetch
+
+        Returns:
+            Dictionary mapping article_id -> article_dict for found articles
+        """
+        if not article_ids:
+            return {}
+
+        results = {}
+        missing_ids = []
+
+        # Step 1: Check cache for all IDs
+        for article_id in article_ids:
+            cached = await cache_service.get_article(article_id)
+            if cached:
+                results[article_id] = cached
+            else:
+                missing_ids.append(article_id)
+
+        if not missing_ids:
+            return results
+
+        # Step 2: Batch query DB for uncached IDs
+        db_result = await self.db.execute(
+            select(Article).where(Article.id.in_(missing_ids))
+        )
+        db_articles = db_result.scalars().all()
+
+        # Store DB results and cache them
+        db_found_ids = set()
+        for article in db_articles:
+            article_dict = article.to_dict()
+            results[article.id] = article_dict
+            db_found_ids.add(article.id)
+            await cache_service.set_article(article.id, article_dict)
+
+        # Step 3: Fetch remaining IDs from OpenAlex (in parallel)
+        still_missing = [aid for aid in missing_ids if aid not in db_found_ids]
+
+        if still_missing:
+            # Filter for OpenAlex-like IDs
+            openalex_ids = [
+                aid for aid in still_missing
+                if aid.startswith("W") or aid.startswith("openalex_")
+            ]
+
+            if openalex_ids:
+                # Fetch in parallel using asyncio.gather
+                async def fetch_one(article_id: str):
+                    work_id = article_id.replace("openalex_", "")
+                    work = await openalex_client.get_work(work_id)
+                    if work:
+                        article_dict = work_to_article_dict(work)
+                        await cache_service.set_article(article_id, article_dict)
+                        return (article_id, article_dict)
+                    return (article_id, None)
+
+                openalex_results = await asyncio.gather(
+                    *[fetch_one(aid) for aid in openalex_ids],
+                    return_exceptions=True
+                )
+
+                # Process results
+                for result in openalex_results:
+                    if isinstance(result, tuple) and result[1] is not None:
+                        article_id, article_dict = result
+                        results[article_id] = article_dict
+
+        return results

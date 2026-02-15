@@ -7,7 +7,7 @@ Formats:
 - Articles: Автор И. О. Название статьи // Журнал. — Год. — Т. vol. — № issue. — С. pages.
 - Electronic: Автор И. О. Название [Электронный ресурс]. — URL: url (дата обращения: dd.mm.yyyy).
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Protocol
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
@@ -90,6 +90,39 @@ class BibliographyEntry:
     conference_name: Optional[str] = None
     conference_location: Optional[str] = None
     conference_date: Optional[str] = None
+
+
+class BibliographyFormatter(Protocol):
+    """Protocol defining the interface for bibliography formatters."""
+
+    def format(self, entry: BibliographyEntry) -> str:
+        """
+        Format a single bibliography entry.
+
+        Args:
+            entry: Bibliography entry to format
+
+        Returns:
+            Formatted string according to the bibliography style
+        """
+        ...
+
+    def format_list(
+        self,
+        entries: List[BibliographyEntry],
+        sort_by: str = "author"
+    ) -> List[str]:
+        """
+        Format and sort a list of bibliography entries.
+
+        Args:
+            entries: List of bibliography entries to format
+            sort_by: Sort order (author, year, title)
+
+        Returns:
+            List of formatted strings with numbering
+        """
+        ...
 
 
 class GOSTFormatter:
@@ -374,5 +407,72 @@ def article_to_bibliography_entry(article: dict) -> BibliographyEntry:
     )
 
 
+# --- VAK RB Conversion ---
+
+def convert_to_vak_rb(gost_formatted: str) -> str:
+    """
+    Convert GOST R formatted string to VAK RB format.
+
+    Key differences:
+    1. Replace em-dash (—) with en-dash (–)
+    2. Simplify multi-author format to max 1 author + [и др.]
+    3. Remove periods after volume/issue numbers
+
+    Args:
+        gost_formatted: String formatted according to GOST R
+
+    Returns:
+        String formatted according to VAK RB
+    """
+    result = gost_formatted
+
+    # 1. Replace GOST em-dash with VAK en-dash
+    result = result.replace(" — ", " – ")
+
+    # 2. Simplify multiple authors in responsibility zone
+    # Pattern: "/ А. Б. Иванов, В. Г. Петров, С. Д. Сидоров" -> "/ А. Б. Иванов [и др.]"
+    import re
+    # Match responsibility zone with 2+ authors
+    responsibility_pattern = r'(/ [А-ЯЁA-Z]\. [А-ЯЁA-Z]\. [А-ЯЁа-яёa-z]+)(, [А-ЯЁA-Z]\. [А-ЯЁA-Z]\. [А-ЯЁа-яёa-z]+)+'
+    result = re.sub(responsibility_pattern, r'\1 [и др.]', result)
+
+    # 3. Remove periods after volume and issue numbers
+    # "Т. 15." -> "Т. 15"
+    result = re.sub(r'(Т\. \d+)\.', r'\1', result)
+    # "№ 3." -> "№ 3"
+    result = re.sub(r'(№ \d+)\.', r'\1', result)
+
+    return result
+
+
+def get_formatter(style: str = "GOST_R_7_0_100_2018") -> BibliographyFormatter:
+    """
+    Get formatter for specified bibliography style.
+
+    Args:
+        style: Bibliography style
+            - "GOST_R_7_0_100_2018" - Russian GOST standard (default)
+            - "VAK_RB" - Belarus VAK requirements
+
+    Returns:
+        Formatter implementing BibliographyFormatter protocol
+    """
+    if style == "VAK_RB":
+        # Return wrapped formatter that converts GOST to VAK RB
+        class VAKRBFormatter:
+            def format(self, entry: BibliographyEntry) -> str:
+                gost_output = gost_formatter.format(entry)
+                return convert_to_vak_rb(gost_output)
+
+            def format_list(self, entries: List[BibliographyEntry], sort_by: str = "author") -> List[str]:
+                gost_list = gost_formatter.format_list(entries, sort_by)
+                return [convert_to_vak_rb(item) for item in gost_list]
+
+        return VAKRBFormatter()
+
+    return gost_formatter
+
+
 # --- Singleton instance ---
 gost_formatter = GOSTFormatter()
+vak_rb_formatter = get_formatter("VAK_RB")
